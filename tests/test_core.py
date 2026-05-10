@@ -56,15 +56,31 @@ def test_proxy_pool_add():
     assert proxies_dict is None  # 未绑定账号则返回 None
 
 
-def test_sign_service_placeholder():
-    """测试签名服务占位符模式"""
+def test_sign_service_xhshow():
+    """测试 xhshow 签名服务 - 验证返回真实签名字段"""
     from src.crawler.sign_service import SignService
 
     svc = SignService()
-    result = svc.sign("/api/sns/web/v2/comment/page", data={"note_id": "abc"}, cookie="")
+    # 使用空 cookie 测试签名生成（无需真实账号）
+    result = svc.sign_post(
+        uri="/api/sns/web/v2/comment/page",
+        cookie="a1=fake_a1_value; web_session=fake_session",
+        payload={"note_id": "abc123"},
+        account_id="test_sign_acct",
+    )
+    # xhshow 应生成有效的 x-s（mns0301_ 开头）和 x-t
     assert "x-s" in result
     assert "x-t" in result
-    assert len(result["x-t"]) > 0
+    assert result["x-s"], "x-s 不应为空"
+    assert result["x-t"], "x-t 不应为空"
+    # Session 复用：同一账号再签一次，序列号应递增
+    result2 = svc.sign_post(
+        uri="/api/sns/web/v2/comment/page",
+        cookie="a1=fake_a1_value; web_session=fake_session",
+        payload={"note_id": "abc123"},
+        account_id="test_sign_acct",
+    )
+    assert result2["x-s"] != result["x-s"], "两次签名应不同（序列号递增）"
 
 
 def test_xsec_token_extract_note_id():

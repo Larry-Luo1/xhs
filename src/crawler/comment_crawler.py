@@ -35,13 +35,13 @@ from src.utils.throttle import ThrottleManager
 _COMMENT_API = "https://edith.xiaohongshu.com/api/sns/web/v2/comment/page"
 _API_PATH = "/api/sns/web/v2/comment/page"
 
-# 固定请求头（非签名部分）
+# xhshow 生成的 User-Agent（与签名内嵌 UA 保持一致）
+from xhshow.config.config import CryptoConfig as _CryptoConfig
+_XHSHOW_UA = _CryptoConfig.PUBLIC_USERAGENT
+
+# 固定请求头（非签名部分）；x-s/x-t 等由 SignService 补充
 _BASE_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
+    "User-Agent": _XHSHOW_UA,
     "Origin": "https://www.xiaohongshu.com",
     "Referer": "https://www.xiaohongshu.com/",
     "Content-Type": "application/json",
@@ -144,8 +144,7 @@ class XhsCrawler:
                 cookie=cookie,
                 xsec_token=xsec_token,
                 cursor=cursor,
-                proxies=proxies,
-            )
+                proxies=proxies,                sign_service=self.sign_service,            )
 
             if result is None:
                 logger.warning(f"[{note_id}] 第 {page} 页请求失败，停止翻页")
@@ -180,11 +179,13 @@ class XhsCrawler:
         xsec_token: str,
         cursor: str,
         proxies: Optional[Dict],
+        sign_service: "SignService" = None,
     ) -> Optional[Dict]:
         for attempt in range(1, MAX_RETRIES + 1):
             try:
                 resp_data = self._do_request(
                     note_id=note_id,
+                    account_id=account_id,
                     cookie=cookie,
                     xsec_token=xsec_token,
                     cursor=cursor,
@@ -204,8 +205,8 @@ class XhsCrawler:
                     return None
 
                 if code == 403 or code == -2:  # 签名错误
-                    logger.warning(f"[{note_id}] 签名失效 (code={code})，尝试重签")
-                    # 签名是无状态的，下次循环会重新生成
+                    logger.warning(f"[{note_id}] 签名失效 (code={code})，重置 Session 重签")
+                    self.sign_service.invalidate_session(account_id)
                     continue
 
                 if code == -9:  # 频率限制
@@ -239,6 +240,7 @@ class XhsCrawler:
     def _do_request(
         self,
         note_id: str,
+        account_id: str,
         cookie: str,
         xsec_token: str,
         cursor: str,
@@ -252,16 +254,19 @@ class XhsCrawler:
             "xsec_token": xsec_token,
         }
 
-        sign = self.sign_service.sign(uri=_API_PATH, data=payload, cookie=cookie)
+        # xhshow sign_headers_post 返回包含 x-s/x-t/x-s-common 等的完整 headers dict
+        sign_headers = self.sign_service.sign_post(
+            uri=_API_PATH,
+            cookie=cookie,
+            payload=payload,
+            account_id=account_id,
+        )
 
         headers = {
             **_BASE_HEADERS,
             "Cookie": cookie,
-            "x-s": sign["x-s"],
-            "x-t": sign["x-t"],
+            **sign_headers,  # 覆盖签名字段
         }
-        if sign.get("x-s-common"):
-            headers["x-s-common"] = sign["x-s-common"]
 
         resp = requests.post(
             _COMMENT_API,

@@ -1,119 +1,79 @@
 """
-请求签名服务 - 生成 x-s / x-t / x-s-common
+请求签名服务 - 基于 xhshow 纯 Python 签名库
 
-优先级：
-  1. xhshow（纯 Python 签名库，pip install xhshow）
-  2. execjs + 本地 JS 签名文件（assets/sign.js）
-  3. 占位符（用于开发调试，不会发出有效请求）
+xhshow.Xhshow 是主客户端，sign_headers_post() 一次调用即可返回
+包含 x-s、x-t、x-s-common 等所有签名请求头的 dict。
+
+每个账号维护独立的 SessionManager，以保持序列号连续性，
+让签名更接近真实浏览器行为。
 """
 from __future__ import annotations
 
-import hashlib
-import os
-import time
+import threading
 from typing import Dict, Optional
 
 from src.utils.logger import logger
 
-# ---------- 尝试加载 xhshow ----------
 try:
-    import xhshow  # type: ignore
+    from xhshow.client import Xhshow
+    from xhshow.session import SessionManager
     _XHSHOW_AVAILABLE = True
-    logger.info("签名后端: xhshow (纯Python)")
 except ImportError:
     _XHSHOW_AVAILABLE = False
-
-# ---------- 尝试加载 execjs ----------
-try:
-    import execjs  # type: ignore
-    _EXECJS_AVAILABLE = True
-except ImportError:
-    _EXECJS_AVAILABLE = False
-
-_JS_SIGN_FILE = os.path.join(os.path.dirname(__file__), "..", "..", "assets", "sign.js")
+    logger.error("xhshow 未安装，请执行: pip install xhshow")
 
 
 class SignService:
     """
-    生成小红书请求所需签名参数：
-      - x-s
-      - x-t
-      - x-s-common（部分接口使用）
+    封装 xhshow 签名客户端。
+
+    - 每个 SignService 实例共享一个 Xhshow() 客户端（线程安全）
+    - 每个账号持有独立的 SessionManager，跨请求维护序列号状态
     """
 
     def __init__(self):
-        self._js_ctx = None
-        self._backend = self._detect_backend()
+        if not _XHSHOW_AVAILABLE:
+            raise RuntimeError("xhshow 未安装，请执行: pip install xhshow")
+        self._client = Xhshow()
+        self._sessions: Dict[str, SessionManager] = {}  # account_id -> SessionManager
+        self._lock = threading.Lock()
+        logger.info("签名后端: xhshow (纯Python)")
 
-    def _detect_backend(self) -> str:
-        if _XHSHOW_AVAILABLE:
-            return "xhshow"
-        if _EXECJS_AVAILABLE and os.path.exists(_JS_SIGN_FILE):
-            try:
-                with open(_JS_SIGN_FILE, "r", encoding="utf-8") as f:
-                    js_code = f.read()
-                self._js_ctx = execjs.compile(js_code)
-                logger.info("签名后端: execjs + sign.js")
-                return "execjs"
-            except Exception as e:
-                logger.warning(f"execjs 初始化失败: {e}")
-        logger.warning(
-            "签名后端: 占位符模式（请安装 xhshow 或提供 assets/sign.js）"
-        )
-        return "placeholder"
+    def get_session(self, account_id: str) -> SessionManager:
+        """获取或创建账号专属 SessionManager"""
+        with self._lock:
+            if account_id not in self._sessions:
+                self._sessions[account_id] = SessionManager()
+                logger.debug(f"[{account_id}] 创建新的签名 SessionManager")
+            return self._sessions[account_id]
 
-    def sign(self, uri: str, data: Optional[Dict] = None, cookie: str = "") -> Dict[str, str]:
+    def sign_post(self, uri: str, cookie: str, payload: Optional[Dict] = None,
+                  account_id: str = "default") -> Dict[str, str]:
         """
-        生成签名，返回需要添加到请求头的字段 dict。
+        为 POST 请求生成完整签名请求头。
 
-        :param uri:    请求路径，如 /api/sns/web/v2/comment/page
-        :param data:   POST body dict（某些签名算法需要）
-        :param cookie: 当前账号的 cookie 字符串
-        :return: {"x-s": ..., "x-t": ..., "x-s-common": ...}
+        :param uri:        请求路径，如 /api/sns/web/v2/comment/page
+        :param cookie:     账号 cookie 字符串
+        :param payload:    POST body dict
+        :param account_id: 账号标识，用于复用 SessionManager
+        :return: 包含签名字段的 headers dict（可直接 merge 进请求头）
         """
-        if self._backend == "xhshow":
-            return self._sign_xhshow(uri, data, cookie)
-        if self._backend == "execjs":
-            return self._sign_execjs(uri, data, cookie)
-        return self._sign_placeholder(uri)
-
-    # ------------------------------------------------------------------
-    # 各后端实现
-    # ------------------------------------------------------------------
-
-    def _sign_xhshow(self, uri: str, data: Optional[Dict], cookie: str) -> Dict[str, str]:
+        session = self.get_session(account_id)
         try:
-            result = xhshow.sign(uri, data=data, cookie=cookie)
-            # xhshow 通常返回 dict with x-s, x-t, x-s-common
-            return {
-                "x-s": result.get("x-s", ""),
-                "x-t": result.get("x-t", str(int(time.time() * 1000))),
-                "x-s-common": result.get("x-s-common", ""),
-            }
+            headers = self._client.sign_headers_post(
+                uri=uri,
+                cookies=cookie,
+                payload=payload,
+                session=session,
+            )
+            logger.debug(f"[{account_id}] 签名成功 uri={uri} x-s={headers.get('x-s', '')[:12]}...")
+            return headers
         except Exception as e:
-            logger.error(f"xhshow 签名失败: {e}")
-            return self._sign_placeholder(uri)
+            logger.error(f"[{account_id}] xhshow 签名失败: {e}")
+            raise
 
-    def _sign_execjs(self, uri: str, data: Optional[Dict], cookie: str) -> Dict[str, str]:
-        try:
-            result = self._js_ctx.call("sign", uri, data or {}, cookie)
-            if isinstance(result, dict):
-                return {
-                    "x-s": result.get("x-s", ""),
-                    "x-t": result.get("x-t", str(int(time.time() * 1000))),
-                    "x-s-common": result.get("x-s-common", ""),
-                }
-        except Exception as e:
-            logger.error(f"execjs 签名失败: {e}")
-        return self._sign_placeholder(uri)
-
-    @staticmethod
-    def _sign_placeholder(uri: str) -> Dict[str, str]:
-        """占位符签名（仅用于开发调试，不能通过服务端校验）"""
-        ts = str(int(time.time() * 1000))
-        fake_xs = hashlib.md5(f"{uri}{ts}".encode()).hexdigest()
-        return {
-            "x-s": fake_xs,
-            "x-t": ts,
-            "x-s-common": "",
-        }
+    def invalidate_session(self, account_id: str) -> None:
+        """签名失效时重置 SessionManager（清除序列号状态）"""
+        with self._lock:
+            self._sessions.pop(account_id, None)
+        logger.debug(f"[{account_id}] 签名 Session 已重置")

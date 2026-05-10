@@ -2,9 +2,8 @@
 playwright>=1.40.0
 requests>=2.31.0
 
-# 签名生成（优先使用 xhshow，若无法安装可用 execjs + sign.js 兜底）
-# xhshow>=0.1.0
-execjs>=1.5.1
+# 签名生成 - xhshow 纯Python实现（方案A核心）
+xhshow>=0.1.9
 
 # 数据存储
 SQLAlchemy>=2.0.0
