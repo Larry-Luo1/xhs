@@ -2,27 +2,30 @@
 主入口 - 小红书评论用户 ID 采集系统
 
 用法：
-  python main.py --help
-  python main.py login --account my_account
-  python main.py proxy add --host 1.2.3.4 --port 8080
-  python main.py crawl --url "https://www.xiaohongshu.com/explore/xxxx"
-  python main.py crawl --file urls.txt
-  python main.py proxy check
+  python main.py login-phone              # 批量手机验证码登录所有 phone_data.txt 账号
+  python main.py login-phone --phone +15416485577  # 登录指定手机号
+  python main.py login --account acct_01  # 扫码登录（备用）
+  python main.py validate                 # 验证所有账号 Cookie 有效性
+  python main.py crawl --url "..."        # 单帖爬取
+  python main.py crawl --file urls.txt --workers 3  # 多帖并发爬取
+  python main.py accounts                 # 列出所有账号
+  python main.py proxy list               # 列出所有代理
 """
 import argparse
+import json
 import sys
 
-from config.config import ACCOUNTS, PROXIES
+from config.config import ACCOUNTS, PROXIES, PHONE_ACCOUNTS
 from src.account.account_pool import AccountPool
-from src.account.login import login_and_get_cookie
-from src.crawler.comment_crawler import XhsCrawler
+from src.account.login import login_and_get_cookie, phone_login
+from src.crawler.comment_crawler import XhsCrawler, crawl_many
 from src.proxy.proxy_pool import ProxyPool
 from src.utils.db import init_db
 from src.utils.logger import logger, setup_logger
 
 
 # -------------------------------------------------------------------------
-# 子命令：login
+# 子命令：login（扫码，保留备用）
 # -------------------------------------------------------------------------
 
 def cmd_login(args) -> None:
@@ -35,6 +38,81 @@ def cmd_login(args) -> None:
     else:
         logger.error(f"账号 {args.account} 登录失败")
         sys.exit(1)
+
+
+# -------------------------------------------------------------------------
+# 子命令：login-phone（手机验证码自动登录）
+# -------------------------------------------------------------------------
+
+def cmd_login_phone(args) -> None:
+    """批量或单个手机号验证码登录"""
+    account_pool = AccountPool()
+    proxy_pool = ProxyPool()
+
+    # 确定要登录的手机号列表
+    targets = PHONE_ACCOUNTS  # 全部
+    if args.phone:
+        targets = [p for p in PHONE_ACCOUNTS if p["phone"] == args.phone]
+        if not targets:
+            logger.error(f"phone_data.txt 中未找到手机号 {args.phone}")
+            sys.exit(1)
+
+    if not targets:
+        logger.error("phone_data.txt 为空或未找到手机号")
+        sys.exit(1)
+
+    success, failed = 0, 0
+    for i, entry in enumerate(targets):
+        phone = entry["phone"]
+        sms_url = entry["sms_url"]
+        account_id = phone  # 用手机号作为账号ID
+
+        # 如果 Cookie 已有效，跳过登录
+        account_pool.add_account(account_id, username=phone)
+        if not args.force and account_pool.validate_cookie(account_id):
+            logger.info(f"[{phone}] Cookie 仍有效，跳过登录")
+            success += 1
+            continue
+
+        # 从代理池中取一个代理分配给该账号
+        proxy_dict = proxy_pool.bind_proxy_to_account(account_id)
+
+        cookie = phone_login(
+            phone=phone,
+            sms_url=sms_url,
+            proxy=proxy_dict,
+            headless=not args.show_browser,
+        )
+        if cookie:
+            account_pool.update_cookie(account_id, cookie)
+            logger.success(f"[{phone}] 登录成功，Cookie 已保存")
+            success += 1
+        else:
+            logger.error(f"[{phone}] 登录失败")
+            failed += 1
+
+    print(f"\n登录完成：成功 {success}，失败 {failed}")
+
+
+# -------------------------------------------------------------------------
+# 子命令：validate（验证 Cookie 有效性）
+# -------------------------------------------------------------------------
+
+def cmd_validate(args) -> None:
+    pool = AccountPool()
+    accounts = pool.list_accounts()
+    active = [a for a in accounts if a["status"] == "active"]
+    print(f"检测 {len(active)} 个 active 账号...")
+    valid, invalid = 0, 0
+    for a in active:
+        ok = pool.validate_cookie(a["account_id"])
+        status = "✓ 有效" if ok else "✗ 失效"
+        print(f"  {a['account_id']:<24} {status}")
+        if ok:
+            valid += 1
+        else:
+            invalid += 1
+    print(f"\n有效: {valid}，失效: {invalid}")
 
 
 # -------------------------------------------------------------------------
@@ -78,11 +156,11 @@ def cmd_accounts(args) -> None:
     if not accounts:
         print("账号池为空")
         return
-    print(f"{'账号ID':<20} {'状态':<16} {'请求数':<10} {'Cookie更新时间'}")
-    print("-" * 70)
+    print(f"{'账号ID':<26} {'状态':<16} {'请求数':<10} {'Cookie更新时间'}")
+    print("-" * 75)
     for a in accounts:
         print(
-            f"{a['account_id']:<20} {a['status']:<16} "
+            f"{a['account_id']:<26} {a['status']:<16} "
             f"{a['request_count'] or 0:<10} {a['cookie_updated_at'] or '-'}"
         )
 
@@ -92,12 +170,9 @@ def cmd_accounts(args) -> None:
 # -------------------------------------------------------------------------
 
 def cmd_crawl(args) -> None:
-    crawler = XhsCrawler()
     urls = []
-
     if args.url:
         urls.append(args.url)
-
     if args.file:
         try:
             with open(args.file, "r", encoding="utf-8") as f:
@@ -113,11 +188,22 @@ def cmd_crawl(args) -> None:
         logger.error("请通过 --url 或 --file 指定帖子链接")
         sys.exit(1)
 
-    all_results = {}
-    for url in urls:
-        logger.info(f"开始处理: {url}")
-        user_ids = crawler.fetch_comment_user_ids(url)
-        all_results[url] = user_ids
+    workers = getattr(args, "workers", 1)
+
+    # 并发模式
+    if workers > 1 or len(urls) > 1:
+        # 获取所有 active 账号 ID
+        pool = AccountPool()
+        all_accounts = [a["account_id"] for a in pool.list_accounts() if a["status"] == "active"]
+        account_ids = [args.account] if args.account else (all_accounts or None)
+        all_results = crawl_many(urls, max_workers=workers, account_ids=account_ids)
+    else:
+        crawler = XhsCrawler()
+        result = crawler.fetch_comment_user_ids(urls[0], account_id=args.account or None)
+        all_results = {urls[0]: result}
+
+    # 打印
+    for url, user_ids in all_results.items():
         print(f"\n[{url}]")
         if user_ids:
             print(f"  共 {len(user_ids)} 个评论用户 ID:")
@@ -127,7 +213,6 @@ def cmd_crawl(args) -> None:
             print("  无评论或采集失败")
 
     if args.output:
-        import json
         with open(args.output, "w", encoding="utf-8") as f:
             json.dump(all_results, f, ensure_ascii=False, indent=2)
         logger.success(f"结果已保存到 {args.output}")
@@ -138,7 +223,6 @@ def cmd_crawl(args) -> None:
 # -------------------------------------------------------------------------
 
 def _bootstrap_from_config() -> None:
-    """将 config.py 中预设的账号和代理导入数据库"""
     account_pool = AccountPool()
     proxy_pool = ProxyPool()
 
@@ -147,7 +231,6 @@ def _bootstrap_from_config() -> None:
             account_id=acc.get("account_id", ""),
             username=acc.get("username", ""),
         )
-        # 如果配置中已有 cookie，直接更新
         if acc.get("cookie"):
             account_pool.update_cookie(
                 account_id=acc["account_id"],
@@ -177,7 +260,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     sub = parser.add_subparsers(dest="command")
 
-    # login
+    # login（扫码，备用）
     p_login = sub.add_parser("login", help="登录账号并保存 Cookie")
     p_login.add_argument("--account", required=True, help="账号唯一标识（自定义）")
     p_login.add_argument("--username", default="", help="账号用户名/手机号（可选）")
@@ -205,6 +288,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_crawl.add_argument("--url", default="", help="单个帖子 URL")
     p_crawl.add_argument("--file", default="", help="包含多个帖子 URL 的文本文件（每行一个）")
     p_crawl.add_argument("--output", default="", help="结果输出 JSON 文件路径")
+    p_crawl.add_argument("--account", default="", help="指定使用的账号 ID，不指定则自动轮询")
+    p_crawl.add_argument("--workers", type=int, default=1, help="并发数（默认 1，多 URL 时建议设为账号数）")
+
+    # login-phone（手机验证码自动登录）
+    p_lp = sub.add_parser("login-phone", help="手机验证码自动登录（读取 phone_data.txt）")
+    p_lp.add_argument("--phone", default="", help="指定单个手机号，不填则批量登录全部")
+    p_lp.add_argument("--force", action="store_true", help="强制重新登录（即使 Cookie 仍有效）")
+    p_lp.add_argument("--show-browser", action="store_true", help="显示浏览器窗口（调试用）")
+
+    # validate
+    sub.add_parser("validate", help="验证所有账号 Cookie 有效性")
 
     return parser
 
@@ -214,15 +308,15 @@ def main() -> None:
     args = parser.parse_args()
 
     setup_logger(log_level=args.log_level)
-
-    # 初始化数据库
     init_db()
-
-    # 从配置文件导入预设账号/代理
     _bootstrap_from_config()
 
     if args.command == "login":
         cmd_login(args)
+    elif args.command == "login-phone":
+        cmd_login_phone(args)
+    elif args.command == "validate":
+        cmd_validate(args)
     elif args.command == "proxy":
         cmd_proxy(args)
     elif args.command == "accounts":

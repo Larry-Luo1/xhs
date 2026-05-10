@@ -64,22 +64,33 @@ class XhsCrawler:
     # 主入口
     # ------------------------------------------------------------------
 
-    def fetch_comment_user_ids(self, note_url: str) -> List[str]:
+    def fetch_comment_user_ids(self, note_url: str, account_id: Optional[str] = None) -> List[str]:
         """
         采集指定帖子下所有评论的用户 ID 列表（去重）。
 
-        :param note_url: 帖子完整 URL
+        :param note_url: 帖子完整 URL（支持短链 xhslink.com）
+        :param account_id: 指定账号 ID，为 None 时自动轮询
         :return: user_id 列表
         """
-        note_id = XsecTokenManager.extract_note_id_from_url(note_url)
+        # 展开短链，同时提取 URL 中携带的 xsec_token
+        resolved_url, url_xsec_token = self._resolve_url(note_url)
+
+        note_id = XsecTokenManager.extract_note_id_from_url(resolved_url)
         if not note_id:
-            logger.error(f"无法从 URL 解析 note_id: {note_url}")
+            logger.error(f"无法从 URL 解析 note_id: {resolved_url}")
             return []
 
         logger.info(f"开始采集帖子 {note_id} 的评论用户")
-        task = self._get_or_create_task(note_id, note_url)
+        task = self._get_or_create_task(note_id, resolved_url)
 
-        account = self.account_pool.get_active_account()
+        if account_id:
+            account = self.account_pool.get_account_by_id(account_id)
+            if not account:
+                logger.error(f"指定账号 {account_id} 不存在或无效")
+                self._update_task_status(note_id, "failed", "account not found")
+                return []
+        else:
+            account = self.account_pool.get_active_account()
         if not account:
             logger.error("没有可用账号，终止采集")
             self._update_task_status(note_id, "failed", "no available account")
@@ -92,8 +103,12 @@ class XhsCrawler:
         self.proxy_pool.bind_proxy_to_account(account_id)
         proxies = self.proxy_pool.build_requests_proxies(account_id)
 
-        # 获取 xsec_token
-        xsec_token = self.token_manager.get_token(note_id, note_url, account_id, cookie)
+        # 优先使用 URL 中的 xsec_token，否则通过 Playwright 获取
+        if url_xsec_token:
+            logger.info(f"使用 URL 中携带的 xsec_token")
+            xsec_token = url_xsec_token
+        else:
+            xsec_token = self.token_manager.get_token(note_id, resolved_url, account_id, cookie)
         if not xsec_token:
             logger.warning(f"无法获取 xsec_token，将尝试不带 token 请求（可能失败）")
 
@@ -107,6 +122,7 @@ class XhsCrawler:
                 cookie=cookie,
                 xsec_token=xsec_token or "",
                 proxies=proxies,
+                note_url=resolved_url,
             )
         except Exception as e:
             logger.error(f"采集帖子 {note_id} 出错: {e}")
@@ -123,6 +139,26 @@ class XhsCrawler:
     # 分页采集
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _resolve_url(url: str):
+        """展开短链，返回 (resolved_url, xsec_token_or_None)"""
+        import urllib.parse as _up
+        if "xhslink.com" in url or "xiaohongshu.com" not in url:
+            try:
+                import requests as _req
+                r = _req.get(url, allow_redirects=True, timeout=10)
+                url = r.url
+                logger.debug(f"短链展开: {url}")
+            except Exception as e:
+                logger.warning(f"短链展开失败: {e}，使用原始 URL")
+        parsed = _up.urlparse(url)
+        params = _up.parse_qs(parsed.query)
+        token = params.get("xsec_token", [None])[0]
+        if token:
+            import urllib.parse
+            token = urllib.parse.unquote(token)
+        return url, token
+
     def _crawl_all_pages(
         self,
         note_id: str,
@@ -130,6 +166,7 @@ class XhsCrawler:
         cookie: str,
         xsec_token: str,
         proxies: Optional[Dict],
+        note_url: str = "",
     ) -> Set[str]:
         user_ids: Set[str] = set()
         cursor = ""
@@ -246,37 +283,40 @@ class XhsCrawler:
         cursor: str,
         proxies: Optional[Dict],
     ) -> Optional[Dict]:
-        payload = {
+        params = {
             "note_id": note_id,
             "cursor": cursor,
             "top_comment_id": "",
-            "image_formats": ["jpg", "webp", "avif"],
+            "image_formats": "jpg,webp,avif",
             "xsec_token": xsec_token,
+            "xsec_source": "pc_feed",
         }
 
-        # xhshow sign_headers_post 返回包含 x-s/x-t/x-s-common 等的完整 headers dict
-        sign_headers = self.sign_service.sign_post(
+        # xhshow sign_headers_get 返回包含 x-s/x-t/x-s-common 的 headers dict
+        sign_headers = self.sign_service.sign_get(
             uri=_API_PATH,
             cookie=cookie,
-            payload=payload,
+            params=params,
             account_id=account_id,
         )
 
         headers = {
             **_BASE_HEADERS,
             "Cookie": cookie,
-            **sign_headers,  # 覆盖签名字段
+            **sign_headers,
         }
 
-        resp = requests.post(
+        resp = requests.get(
             _COMMENT_API,
-            json=payload,
+            params=params,
             headers=headers,
             proxies=proxies,
             timeout=REQUEST_TIMEOUT,
         )
 
         logger.debug(f"HTTP {resp.status_code} | note={note_id} | cursor={cursor!r}")
+        if resp.status_code != 200:
+            logger.error(f"HTTP {resp.status_code} 响应体: {resp.text[:500]}")
 
         if resp.status_code in (403, 401):
             return {"code": 403, "msg": f"HTTP {resp.status_code}"}
@@ -350,3 +390,49 @@ class XhsCrawler:
                 if total:
                     task.total_comments = total
                 session.commit()
+
+
+def crawl_many(
+    urls: List[str],
+    max_workers: int = 3,
+    account_ids: Optional[List[str]] = None,
+) -> Dict[str, List[str]]:
+    """
+    并发爬取多个帖子。
+
+    :param urls:        帖子 URL 列表
+    :param max_workers: 最大并发数（不超过账号数）
+    :param account_ids: 指定账号列表；None 则自动轮询
+    :return: {url: [user_id, ...]}
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    results: Dict[str, List[str]] = {}
+    lock = __import__("threading").Lock()
+
+    # 每个 worker 绑定一个独立的 XhsCrawler 实例（各自维护 SessionManager）
+    def _worker(url: str, account_id: Optional[str]) -> tuple:
+        crawler = XhsCrawler()
+        try:
+            ids = crawler.fetch_comment_user_ids(url, account_id=account_id)
+            return url, ids
+        except Exception as e:
+            logger.error(f"并发爬取 {url} 出错: {e}")
+            return url, []
+
+    # 分配账号：循环绑定
+    tasks = []
+    for i, url in enumerate(urls):
+        aid = account_ids[i % len(account_ids)] if account_ids else None
+        tasks.append((url, aid))
+
+    actual_workers = min(max_workers, len(tasks))
+    with ThreadPoolExecutor(max_workers=actual_workers) as executor:
+        futures = {executor.submit(_worker, url, aid): url for url, aid in tasks}
+        for future in as_completed(futures):
+            url, ids = future.result()
+            with lock:
+                results[url] = ids
+            logger.info(f"完成: {url} → {len(ids)} 个用户")
+
+    return results

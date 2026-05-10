@@ -102,6 +102,37 @@ class AccountPool:
     def mark_active(self, account_id: str) -> None:
         self._update_status(account_id, AccountStatus.ACTIVE)
 
+    def validate_cookie(self, account_id: str) -> bool:
+        """
+        调用 XHS /api/sns/web/v2/user/me 验证 Cookie 是否仍有效。
+        有效返回 True，否则标记为 invalid 并返回 False。
+        """
+        account = self.get_account_by_id(account_id)
+        if not account or not account.get("cookie"):
+            return False
+        import requests as _req
+        try:
+            r = _req.get(
+                "https://edith.xiaohongshu.com/api/sns/web/v2/user/me",
+                headers={
+                    "Cookie": account["cookie"],
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36 Edg/142.0.0.0",
+                    "Referer": "https://www.xiaohongshu.com/",
+                },
+                timeout=10,
+            )
+            data = r.json()
+            if data.get("code") == 0 and data.get("data"):
+                logger.info(f"账号 {account_id} Cookie 有效")
+                return True
+            else:
+                logger.warning(f"账号 {account_id} Cookie 已失效 (code={data.get('code')})")
+                self.mark_invalid(account_id)
+                return False
+        except Exception as e:
+            logger.warning(f"账号 {account_id} Cookie 验证异常: {e}")
+            return False
+
     def increment_request_count(self, account_id: str) -> None:
         with get_session() as session:
             account = session.query(Account).filter(Account.account_id == account_id).first()

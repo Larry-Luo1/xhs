@@ -51,12 +51,6 @@ class SignService:
                   account_id: str = "default") -> Dict[str, str]:
         """
         为 POST 请求生成完整签名请求头。
-
-        :param uri:        请求路径，如 /api/sns/web/v2/comment/page
-        :param cookie:     账号 cookie 字符串
-        :param payload:    POST body dict
-        :param account_id: 账号标识，用于复用 SessionManager
-        :return: 包含签名字段的 headers dict（可直接 merge 进请求头）
         """
         session = self.get_session(account_id)
         try:
@@ -69,7 +63,32 @@ class SignService:
             logger.debug(f"[{account_id}] 签名成功 uri={uri} x-s={headers.get('x-s', '')[:12]}...")
             return headers
         except Exception as e:
-            logger.error(f"[{account_id}] xhshow 签名失败: {e}")
+            logger.error(f"[{account_id}] xhshow POST 签名失败: {e}")
+            raise
+
+    def sign_get(self, uri: str, cookie: str, params: Optional[Dict] = None,
+                 account_id: str = "default") -> Dict[str, str]:
+        """
+        为 GET 请求生成完整签名请求头。
+
+        :param uri:        请求路径，如 /api/sns/web/v2/comment/page
+        :param cookie:     账号 cookie 字符串
+        :param params:     GET 查询参数 dict
+        :param account_id: 账号标识
+        :return: 签名 headers dict
+        """
+        session = self.get_session(account_id)
+        try:
+            headers = self._client.sign_headers_get(
+                uri=uri,
+                cookies=cookie,
+                params=params,
+                session=session,
+            )
+            logger.debug(f"[{account_id}] GET 签名成功 uri={uri} x-s={headers.get('x-s', '')[:12]}...")
+            return headers
+        except Exception as e:
+            logger.error(f"[{account_id}] xhshow GET 签名失败: {e}")
             raise
 
     def invalidate_session(self, account_id: str) -> None:
